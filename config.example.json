@@ -1,0 +1,11 @@
+{
+  "_説明": "frame-care の設定。変えたら systemctl --user restart frame-care。項目の意味は docs/DEVELOPMENT.md",
+  "break": {"enabled": true, "every_minutes": 60},
+  "hydration": {"enabled": false, "every_minutes": 45},
+  "battery": {"enabled": true, "levels": [20, 10]},
+  "temperature": {"enabled": true, "warn_c": 85, "urgent_c": 90},
+  "charge_done": {"enabled": true},
+  "quiet_hours": {"enabled": false, "start": "01:00", "end": "08:00"},
+  "presence": {"source": "steamvr", "proximity_threshold": null},
+  "rate_limit": {"min_gap_seconds": 20, "max_per_hour": 12}
+}

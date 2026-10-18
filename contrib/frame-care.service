@@ -1,0 +1,13 @@
+[Unit]
+Description=frame-care (Steam Frame break / battery / temperature reminders)
+# 他の Frame ツールと同じく、SteamVR が動いている間だけ動かす
+After=steamvr.service
+PartOf=steamvr.service
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/opt/frame-care/frame-care.py
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=steamvr.service
