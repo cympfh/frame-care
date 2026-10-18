@@ -128,6 +128,8 @@ def unit_tests():
     check(len(sent) == 2, "回数制限: 20 秒以内と 1 時間 2 回を超えた分は出さない")
     check(keys(c.filter(100, w, [("temp_urgent", "alert", "t", "x")])) == ["temp_urgent"], "回数制限: 高温は制限なし")
     # OSC
+    check(set(fc.KINDS) == set(fc.MESSAGES) and all(v.split(".")[0] in ("alert", "warn", "care") for v in fc.KINDS.values())
+          and all(fc.KINDS[k].startswith("alert.") for k in fc.URGENT), "種類: すべての通知に alert / warn / care が付き、急ぎは alert")
     msg = fc.osc_message("/wrist/notify", "care", "休憩しよう", "本文")
     check(len(msg) % 4 == 0 and decode(msg) == ["/wrist/notify", ",sss", "care", "休憩しよう", "本文"], "OSC: /wrist/notify ,sss")
 
@@ -168,7 +170,7 @@ def e2e_tests():
     out = proc.communicate()[0]
     titles = [g[3] for g in got]
     print("     受け取った:", titles)
-    check(any(g[0] == "/wrist/notify" and g[2] == "alert" and "高温" in g[3] for g in got), "受け手あり: 高温の通知が届く")
+    check(any(g[0] == "/wrist/notify" and g[2] == "alert.temp" and "高温" in g[3] for g in got), "受け手あり: 高温の通知が届く（種類 alert.temp）")
     check(any("電池残りわずか" in t for t in titles), "受け手あり: 電池 9% の通知が届く")
     check(any("休憩" in t for t in titles), "受け手あり: 休憩の通知が届く（3 秒設定）")
     check("通知: " in out, "受け手あり: ログにも残る")

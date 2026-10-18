@@ -20,7 +20,7 @@ import struct
 import sys
 import time
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 DEFAULTS = {
     "toast_host": "127.0.0.1",
@@ -52,6 +52,14 @@ MESSAGES = {
     "test": ("frame-care", "テスト通知です。これが見えれば準備OK"),
 }
 URGENT = {"battery_urgent", "temp_urgent"}          # 静かな時間でも出す
+# カードの種類（vrc-wrist-notifier 0.2.1 から色とアイコンが変わる: alert = 赤、warn = 琥珀、care = 青緑。
+# 「.」のあとはアイコン。古い wrist-toast でも表示はされる（色は青）
+KINDS = {
+    "break": "care.break", "hydration": "care.water", "charge_done": "care.charge",
+    "battery": "warn.battery", "temp_warn": "warn.temp",
+    "battery_urgent": "alert.battery", "temp_urgent": "alert.temp",
+    "test": "care",
+}
 NO_RATE_LIMIT = URGENT | {"battery", "temp_warn"}  # 安全に関わるものは回数制限をかけない
 
 
@@ -266,11 +274,11 @@ class Care:
             b = c["break"]
             if b.get("enabled") and now - self.break_mark >= b["every_minutes"] * 60:
                 minutes = int(round((now - self.worn_since) / 60))
-                out.append(("break", "care") + self._msg("break", minutes=minutes))
+                out.append(("break", KINDS["break"]) + self._msg("break", minutes=minutes))
                 self.break_mark = now
             h = c["hydration"]
             if h.get("enabled") and now - self.hydration_mark >= h["every_minutes"] * 60:
-                out.append(("hydration", "care") + self._msg("hydration"))
+                out.append(("hydration", KINDS["hydration"]) + self._msg("hydration"))
                 self.hydration_mark = now
         elif self.last_worn is not None and now - self.last_worn > absent_reset:
             self.worn_since = None
@@ -289,7 +297,7 @@ class Care:
                     if pct <= level:
                         if level not in self.battery_fired:
                             key = "battery_urgent" if level <= bc.get("urgent_level", 10) else "battery"
-                            out.append((key, "alert" if key in URGENT else "care") + self._msg(key, level=level, percent=pct))
+                            out.append((key, KINDS[key]) + self._msg(key, level=level, percent=pct))
                         self.battery_fired.update(l for l in bc["levels"] if l >= level)
                         break
 
@@ -299,12 +307,12 @@ class Care:
         if tc.get("enabled") and t is not None:
             if t >= tc["urgent_c"]:
                 if self.temp_state != "urgent" or now - self.temp_urgent_at >= tc["urgent_repeat_minutes"] * 60:
-                    out.append(("temp_urgent", "alert") + self._msg("temp_urgent", temp=t))
+                    out.append(("temp_urgent", KINDS["temp_urgent"]) + self._msg("temp_urgent", temp=t))
                     self.temp_urgent_at = now
                 self.temp_state = "urgent"
             elif t >= tc["warn_c"]:
                 if self.temp_state == "ok":
-                    out.append(("temp_warn", "care") + self._msg("temp_warn", temp=t))
+                    out.append(("temp_warn", KINDS["temp_warn"]) + self._msg("temp_warn", temp=t))
                     self.temp_state = "warn"
             elif t < tc["rearm_below_c"]:
                 self.temp_state = "ok"
@@ -322,7 +330,7 @@ class Care:
                 full = r.get("status") == "Full" or pct >= 100 or (
                     pct >= cd.get("full_percent", 98) and r.get("status") != "Charging")
                 if s["low_seen"] and not s["done"] and full:
-                    out.append(("charge_done", "care") + self._msg("charge_done", percent=pct))
+                    out.append(("charge_done", KINDS["charge_done"]) + self._msg("charge_done", percent=pct))
                     s["done"] = True
             else:
                 self.plug_session = None
@@ -396,7 +404,7 @@ def main(argv=None):
         print("静かな時間:", "いま静かな時間です" if in_quiet(cfg["quiet_hours"], dt.datetime.now()) else "いいえ")
         return 0
     if a.test_toast:
-        ok = toaster.send("care", *MESSAGES["test"])
+        ok = toaster.send(KINDS["test"], *MESSAGES["test"])
         print("送りました" if ok else "表示係が動いていないので送っていません")
         return 0 if ok else 1
 

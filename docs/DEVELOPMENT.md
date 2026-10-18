@@ -4,7 +4,7 @@
 
 `poll_seconds`（30 秒）ごとに値を読み、知らせることがあれば `127.0.0.1:39570` に OSC `/wrist/notify ,sss 種類 タイトル 本文` を送ります。
 受け取って表示するのは [vrc-wrist-notifier](https://github.com/cympfh/vrc-wrist-notifier) の Frame 側（wrist-toast）です。
-種類は `care`（ふつう）と `alert`（高温・電池わずか）。
+種類は `基本.アイコン` の形です: `care.break` / `care.water` / `care.charge`（青緑）、`warn.battery` / `warn.temp`（琥珀）、`alert.battery` / `alert.temp`（赤。表示も長め）。色とアイコンが分かれるのは vrc-wrist-notifier 0.2.1 から（それより前の版でも表示はされます）。
 
 送る前に `/proc/net/udp` を見て、そのポートで待ち受けているものが無ければ送らず、ログ（journal）に書くだけにします。
 
