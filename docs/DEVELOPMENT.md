@@ -32,6 +32,7 @@
 | `temperature.rearm_below_c` | 80 | ここまで下がったら、次にまた知らせる |
 | `temperature.urgent_repeat_minutes` | 3 | 警告をくり返す間隔 |
 | `charge_done.min_start_percent` | 95 | これ未満から充電したときだけ「充電完了」を出す |
+| `charge_done.full_percent` | 98 | 電源につないだまま、ここ以上で充電が止まったら（Full でなくても）完了とみなす |
 | `quiet_hours.enabled` / `start` / `end` / `allow_urgent` | false / 01:00 / 08:00 / true | 静かな時間 |
 | `rate_limit.min_gap_seconds` / `max_per_hour` | 20 / 12 | 休憩などの回数制限（温度・電池には効かない） |
 | `presence.source` / `proximity_threshold` / `absent_reset_minutes` | steamvr / null / 5 | かぶっている判定 |

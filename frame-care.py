@@ -36,7 +36,7 @@ DEFAULTS = {
     "hydration": {"enabled": False, "every_minutes": 45},
     "battery": {"enabled": True, "levels": [20, 10], "urgent_level": 10},
     "temperature": {"enabled": True, "warn_c": 85, "urgent_c": 90, "rearm_below_c": 80, "urgent_repeat_minutes": 3},
-    "charge_done": {"enabled": True, "min_start_percent": 95},
+    "charge_done": {"enabled": True, "min_start_percent": 95, "full_percent": 98},
     "quiet_hours": {"enabled": False, "start": "01:00", "end": "08:00", "allow_urgent": True},
     "rate_limit": {"min_gap_seconds": 20, "max_per_hour": 12},
 }
@@ -318,7 +318,9 @@ class Care:
                 s = self.plug_session
                 if pct < cd["min_start_percent"]:
                     s["low_seen"] = True
-                full = r.get("status") == "Full" or pct >= 100
+                # Frame はつないだままでも満タン近くで電池が Discharging になる（充電を休む）ので、それも完了とみなす
+                full = r.get("status") == "Full" or pct >= 100 or (
+                    pct >= cd.get("full_percent", 98) and r.get("status") != "Charging")
                 if s["low_seen"] and not s["done"] and full:
                     out.append(("charge_done", "care") + self._msg("charge_done", percent=pct))
                     s["done"] = True

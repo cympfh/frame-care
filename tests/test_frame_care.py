@@ -105,6 +105,11 @@ def unit_tests():
         got += keys(c.evaluate(0, R(battery=p, status=st, online=True, worn=False)))
     check(got == ["charge_done"], "充電完了: 1 回だけ")
     c = fc.Care(cfg())
+    got = []
+    for p, st in [(70, "Charging"), (97, "Charging"), (98, "Discharging"), (97, "Discharging")]:
+        got += keys(c.evaluate(0, R(battery=p, status=st, online=True, worn=False)))
+    check(got == ["charge_done"], "充電完了: つないだまま 98% で充電が止まった場合も 1 回")
+    c = fc.Care(cfg())
     got = keys(c.evaluate(0, R(battery=100, status="Full", online=True, worn=False)))
     check(got == [], "充電完了: 満タンのままつないだだけなら言わない")
     # 静かな時間
