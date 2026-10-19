@@ -7,14 +7,17 @@ g++ と pango があれば、カードの描画（toast/card.h）の自己テス
 
 設定ファイルや XDG_CONFIG_HOME はすべて一時フォルダにする（本物の ~/.config には触らない）。
 """
+import contextlib
 import datetime as dt
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -34,6 +37,31 @@ with open(os.environ["FAKE_TOAST_OUT"], "a", encoding="utf-8") as f:
     f.write(sys.stdin.buffer.read().decode("utf-8"))
 sys.exit(int(os.environ.get("FAKE_TOAST_RC", "0")))
 """ % sys.executable
+
+# 固まる frame-care-toast: SIGTERM も無視して眠り続ける（FAKE_HANG_CLOSE があれば、先に標準入力を閉じる）
+HANG_TOAST = """#!%s
+import os, signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+if os.environ.get("FAKE_HANG_CLOSE"):
+    os.close(0)
+time.sleep(600)
+""" % sys.executable
+
+
+def script(name, body):
+    path = os.path.join(TMP, name)
+    with open(path, "w") as f:
+        f.write(body)
+    os.chmod(path, 0o755)
+    return path
+
+
+def quiet(f, *a):
+    """f を呼び、ログ（stdout）を返す。"""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        f(*a)
+    return buf.getvalue()
 
 
 def check(cond, what):
@@ -143,6 +171,112 @@ def unit_tests():
     check(not any(k.startswith("toast_") for k in fc.DEFAULTS), "UDP の送り先の設定は無い")
 
 
+def proc_tests():
+    """steamvr_running(): 自分の uid の vrserver だけ、ゾンビは数えない。"""
+    root = os.path.join(TMP, "proc")
+
+    def fake(pid, stat):
+        os.makedirs(os.path.join(root, pid), exist_ok=True)
+        with open(os.path.join(root, pid, "stat"), "w") as f:
+            f.write(stat)
+
+    os.makedirs(root, exist_ok=True)
+    fake("10", "10 (bash) S 1 10 10 0")
+    check(not fc.steamvr_running(root), "vrserver: いなければ False")
+    fake("20", "20 (vrserver) Z 1 20 20 0")
+    check(not fc.steamvr_running(root), "vrserver: ゾンビ（Z）は数えない")
+    fake("30", "30 (vrserver) S 1 30 30 0")
+    check(fc.steamvr_running(root), "vrserver: 動いていれば True")
+    check(not fc.steamvr_running(root, uid=os.getuid() + 1), "vrserver: ほかのユーザーのものは数えない")
+    check(fc.proc_name_state("5 (a) b) c) R 1") == ("a) b) c", "R"), "stat: 名前に ) が入っていても読める")
+    check(fc.proc_name_state("ゴミ") == (None, None), "stat: 読めなければ None")
+
+
+def toaster_tests():
+    """固まった frame-care-toast を止められる・溜めすぎない・渡せなければ片付ける。"""
+    hang = script("hang-toast", HANG_TOAST)
+    fast = cfg(toast={"duration_seconds": 0.01})
+    # 時間切れ: 枚数 × 秒数 × 1.5 + 余裕 を過ぎたら kill
+    t = fc.Toaster(fast, hang)
+    t.slack = 0.5
+    t.send("care", "固まるテスト", "x")
+    quiet(t.pump, True)
+    check(t.busy() and t.deadline is not None, "時間切れ: 渡したら期限を決める")
+    proc = t.proc
+    time.sleep(0.8)
+    t0 = time.monotonic()
+    out = quiet(t.pump, True)
+    check(t.proc is None and proc.returncode is not None and "時間内に終わらない" in out and "固まるテスト" in out
+          and time.monotonic() - t0 < 6, "時間切れ: kill して片付け、出せなかったカードをログに書く")
+    d = fc.Toaster(cfg(), hang)
+    d.send("care", "a", "x"); d.send("care", "b", "x")
+    quiet(d.pump, True)
+    check(abs(d.deadline - time.monotonic() - (2 * 4 * 1.5 + fc.DEADLINE_SLACK)) < 1, "時間切れ: 期限は 2 枚 × 4 秒 × 1.5 + 15 秒")
+    quiet(d.stop)
+    # stop(): SIGTERM を無視されても、3 秒待って kill。すぐ戻る
+    t = fc.Toaster(fast, hang)
+    t.send("care", "止めるテスト", "x")
+    quiet(t.pump, True)
+    proc = t.proc
+    time.sleep(0.3)
+    t0 = time.monotonic()
+    out = quiet(t.stop)
+    took = time.monotonic() - t0
+    check(t.proc is None and proc.returncode is not None and took < 5, "stop(): 固まっていても %.1f 秒で戻る（terminate → 3 秒 → kill）" % took)
+    check("強制終了" in out, "stop(): 強制終了したらログに書く")
+    # 溜めるのは MAX_PENDING 枚まで（古いものから捨てる）
+    t = fc.Toaster(fast, hang)
+    out = ""
+    for i in range(fc.MAX_PENDING + 5):
+        out += quiet(t.send, "care", "カード%d" % i, "x")
+    check(len(t.pending) == fc.MAX_PENDING and t.pending[0][1] == "カード5" and out.count("捨てました") == 5,
+          "溜めすぎ: 上限を超えたら古いものから捨てる")
+    # 標準入力に書けない（読まずに閉じた）: kill して片付ける（ゾンビを残さない）
+    os.environ["FAKE_HANG_CLOSE"] = "1"
+    try:
+        t = fc.Toaster(fast, hang)
+        for i in range(fc.MAX_PENDING):
+            t.send("care", "長い%d" % i, "あ" * 3000)   # パイプに入りきらない量（約 180KB）
+        t0 = time.monotonic()
+        out = quiet(t.pump, True)
+    finally:
+        del os.environ["FAKE_HANG_CLOSE"]
+    check(t.proc is None and "渡せませんでした" in out and time.monotonic() - t0 < 6, "標準入力に書けなければ kill して片付ける")
+
+
+def build_tests():
+    """toast/build.sh --find-lib: openvrpaths.vrpath、Steam のライブラリの順に libopenvr_api.so を探す。"""
+    base = tempfile.mkdtemp(dir=TMP)
+    sub = "linuxarm64" if os.uname().machine in ("aarch64", "arm64") else "linux64"
+    home = os.path.join(base, "home")
+    vrpath_dir = os.path.join(home, ".config", "openvr")
+    steamapps = os.path.join(home, ".local", "share", "Steam", "steamapps")
+    rt, lib2 = os.path.join(base, "rt"), os.path.join(base, "lib2")
+    for d in (os.path.join(rt, "bin", sub), os.path.join(lib2, "steamapps", "common", "SteamVR", "bin", sub)):
+        os.makedirs(d)
+        open(os.path.join(d, "libopenvr_api.so"), "w").close()
+    os.makedirs(vrpath_dir)
+    os.makedirs(steamapps)
+
+    def find():
+        env = dict(os.environ, HOME=home)
+        env.pop("XDG_CONFIG_HOME", None)
+        env.pop("STEAMVR_LIB", None)
+        r = subprocess.run(["bash", os.path.join(ROOT, "toast", "build.sh"), "--find-lib"], capture_output=True,
+                           text=True, env=env)
+        return r.returncode, r.stdout.strip()
+
+    with open(os.path.join(vrpath_dir, "openvrpaths.vrpath"), "w") as f:
+        json.dump({"runtime": [os.path.join(base, "無い"), rt]}, f)
+    check(find() == (0, os.path.join(rt, "bin", sub)), "build.sh: openvrpaths.vrpath の runtime から探す")
+    os.remove(os.path.join(vrpath_dir, "openvrpaths.vrpath"))
+    with open(os.path.join(steamapps, "libraryfolders.vdf"), "w") as f:
+        f.write('"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' % lib2)
+    check(find() == (0, os.path.join(lib2, "steamapps", "common", "SteamVR", "bin", sub)), "build.sh: Steam のライブラリから探す")
+    os.remove(os.path.join(steamapps, "libraryfolders.vdf"))
+    check(find()[0] == 1, "build.sh: 見つからなければ 1 で終わる")
+
+
 def run(args, timeout=30, **env):
     e = dict(ENV, **env)
     return subprocess.run([sys.executable, os.path.join(ROOT, "frame-care.py")] + args, capture_output=True,
@@ -239,6 +373,9 @@ def card_tests():
 
 if __name__ == "__main__":
     unit_tests()
+    proc_tests()
+    toaster_tests()
+    build_tests()
     e2e_tests()
     card_tests()
     shutil.rmtree(TMP, ignore_errors=True)

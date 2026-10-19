@@ -54,11 +54,23 @@ inline Rgb color(const std::string& kind) {
     return {0.18, 0.76, 0.70};                       // 青緑（care / info / そのほか）
 }
 
-// 制御文字を落として、長すぎる文字列を切る（UTF-8 の途中で切らない）
+// 双方向テキストの制御文字（LRM/RLM、U+202A〜202E、U+2066〜2069、ALM）。表示を入れ替えられるので落とす
+inline size_t bidi_control_len(const std::string& s, size_t i) {
+    auto b = [&](size_t k) { return i + k < s.size() ? static_cast<unsigned char>(s[i + k]) : 0; };
+    if (b(0) == 0xE2 && b(1) == 0x80 && (b(2) == 0x8E || b(2) == 0x8F || (b(2) >= 0xAA && b(2) <= 0xAE))) return 3;
+    if (b(0) == 0xE2 && b(1) == 0x81 && b(2) >= 0xA6 && b(2) <= 0xA9) return 3;
+    if (b(0) == 0xD8 && b(1) == 0x9C) return 2;   // U+061C
+    return 0;
+}
+
+// 制御文字（C0、DEL、双方向の制御文字）を落として、長すぎる文字列を切る（UTF-8 の途中で切らない）
 inline std::string clean(const std::string& s, size_t max_bytes) {
     std::string out;
-    for (unsigned char c : s) {
-        if (c < 0x20) continue;
+    for (size_t i = 0; i < s.size();) {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (size_t n = bidi_control_len(s, i)) { i += n; continue; }
+        i++;
+        if (c < 0x20 || c == 0x7F) continue;
         out.push_back(char(c));
     }
     if (out.size() > max_bytes) {
@@ -176,7 +188,9 @@ inline int self_test() {
           "care.break は青緑でカップ");
     check(std::string(icon("warn")) == "⚠" && std::string(icon("alert")) == "!" && std::string(icon("care")) == "♥",
           "アイコンの無い種類");
-    check(clean("a\nb\tc", 10) == "abc", "制御文字を落とす");
+    check(clean("a\nb\tc\x7f", 10) == "abc", "制御文字と DEL を落とす");
+    check(clean("x\u202Eevil\u202C\u2066y\u2069\u200F\u061C", 64) == "xevily", "双方向の制御文字を落とす");
+    check(clean("aあい", 2) == "a…" && clean("aあい", 4) == "aあ…", "文字の途中で切るときは、その文字の前で切る");
     std::string longjp;
     for (int i = 0; i < 100; i++) longjp += "あ";
     std::string cut = clean(longjp, 31);
@@ -186,6 +200,18 @@ inline int self_test() {
           "1 行を読む");
     check(parse_line("warn\tタイトルだけ", k) && k.text.empty(), "本文が無くても読む");
     check(!parse_line("ゴミ", k) && !parse_line("\tタイトル\t本文", k), "読めない行は捨てる");
+    check(!parse_line("care\t\t本文", k) && !parse_line("care\t\x01\u202E\t本文", k), "タイトルが空（制御文字だけも）なら捨てる");
+    {
+        // 乗算済み ARGB32 → 非乗算 RGBA: 半透明の赤 (a=128, r=128) は r=255 に戻る。完全に透明なら色は 0
+        cairo_surface_t* one = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 2, 1);
+        cairo_surface_flush(one);
+        uint32_t px2[2] = {(128u << 24) | (128u << 16) | (64u << 8) | 0u, 0u};
+        memcpy(cairo_image_surface_get_data(one), px2, sizeof px2);
+        cairo_surface_mark_dirty(one);
+        std::vector<uint8_t> o = to_rgba(one);
+        cairo_surface_destroy(one);
+        check(o[0] == 255 && o[1] == 127 && o[2] == 0 && o[3] == 128 && o[4] == 0 && o[7] == 0, "乗算済みの色を元に戻す");
+    }
     cairo_surface_t* s = render({"alert.temp", "本体が高温 91°C", "いったん休ませてください"}, "Noto Sans CJK JP");
     std::vector<uint8_t> px = to_rgba(s);
     cairo_surface_destroy(s);

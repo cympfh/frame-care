@@ -2,15 +2,16 @@
 // frame-care-toast: frame-care のカードを Steam Frame の SteamVR に、視界の正面のトーストとして出す。
 //
 // 標準入力から 1 行 1 枚（種類 TAB タイトル TAB 本文）を読み、順に出し終わったら SteamVR から切断して終わる。
-// SteamVR（vrserver）が動いていなければつながずに終わる（VR_Init は SteamVR を起動してしまうので呼ばない）。
-// うまくいったときは何も出力しない。描画は cairo + pango、画像は Vulkan のテクスチャ（だめなら SetOverlayRaw）。
+// SteamVR を起動しない: 自分の vrserver が動いていなければつながない。つなぐときも VRApplication_Background なので、
+// その間に SteamVR が終わっていても起動はせず、VRInitError_Init_NoServerForBackgroundApp で終わる（終了コード 3）。
+// うまくいったときは何も出力しない。描画は cairo + pango、画像は SetOverlayRaw で渡す。
 //
 // 終了コード: 0 = 全部出した、1 = エラー、2 = 使い方の間違い、3 = SteamVR が動いていない、4 = 途中で SteamVR が終わった
 #include "openvr.h"
 #include "card.h"
-#include "vk_texture.h"
 
 #include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -48,48 +49,29 @@ struct Options {
     std::string font = "Noto Sans CJK JP";
 };
 
-// /proc に comm が vrserver のプロセスがあるか
+// 自分（同じ uid）の vrserver が動いているか。ゾンビ（/proc/PID/stat の状態が Z）は数えない
 static bool steamvr_running() {
     DIR* d = opendir("/proc");
     if (!d) return false;
+    const uid_t me = getuid();
     bool found = false;
     while (dirent* e = readdir(d)) {
         const char* n = e->d_name;
         bool digits = *n != '\0';
         for (const char* p = n; *p; p++) digits = digits && *p >= '0' && *p <= '9';
         if (!digits) continue;
-        std::ifstream f(std::string("/proc/") + n + "/comm");
-        std::string comm;
-        if (std::getline(f, comm) && comm == "vrserver") { found = true; break; }
+        std::string dir = std::string("/proc/") + n;
+        struct stat st;
+        if (::stat(dir.c_str(), &st) != 0 || st.st_uid != me) continue;
+        std::ifstream f(dir + "/stat");
+        std::string line;
+        if (!std::getline(f, line)) continue;
+        size_t open = line.find('('), close = line.rfind(')');   // 名前は最初の ( から最後の ) まで
+        if (open == std::string::npos || close == std::string::npos || close < open || close + 2 >= line.size()) continue;
+        if (line.compare(open + 1, close - open - 1, "vrserver") == 0 && line[close + 2] != 'Z') { found = true; break; }
     }
     closedir(d);
     return found;
-}
-
-// f() のあいだ stderr に書かれたものを預かり、f() が失敗したときだけ出す
-// （vk_texture.cpp は無改変のコピーで、うまくいったときも使う GPU などを書くので、問題が無いときは黙らせる）
-template <class F>
-static bool quiet_unless_failed(F f) {
-    fflush(stderr);
-    FILE* held = tmpfile();
-    int saved = held ? dup(2) : -1;
-    if (saved >= 0) dup2(fileno(held), 2);
-    bool ok = f();
-    fflush(stderr);
-    if (saved >= 0) {
-        dup2(saved, 2);
-        close(saved);
-    }
-    if (held) {
-        if (!ok) {
-            rewind(held);
-            char buf[512];
-            size_t n;
-            while ((n = fread(buf, 1, sizeof buf, held)) > 0) fwrite(buf, 1, n, stderr);
-        }
-        fclose(held);
-    }
-    return ok;
 }
 
 static double now_s() {
@@ -101,9 +83,6 @@ static double now_s() {
 struct Vr {
     bool up = false;
     vr::VROverlayHandle_t toast = vr::k_ulOverlayHandleInvalid;
-    VulkanContext* vk = nullptr;
-    OverlayTexture* tex = nullptr;
-    bool use_vulkan = false;
 };
 
 static const char* oerr(vr::EVROverlayError e) { return vr::VROverlay()->GetOverlayErrorNameFromEnum(e); }
@@ -111,57 +90,33 @@ static const char* oerr(vr::EVROverlayError e) { return vr::VROverlay()->GetOver
 static void vr_stop(Vr& v) {
     if (!v.up) return;
     vr::VR_Shutdown();
-    // Vulkan のものは VR_Shutdown のあとで壊す
-    delete v.tex;
-    v.tex = nullptr;
-    delete v.vk;
-    v.vk = nullptr;
     v.up = false;
     v.toast = vr::k_ulOverlayHandleInvalid;
 }
 
-static bool vr_start(Vr& v, const Options& o) {
+// つなぐ。戻り値は終了コード（kOk ならつながった）
+static int vr_start(Vr& v, const Options& o) {
     vr::EVRInitError err = vr::VRInitError_None;
-    vr::VR_Init(&err, vr::VRApplication_Overlay);
+    vr::VR_Init(&err, vr::VRApplication_Background);   // SteamVR が動いていなくても起動しない
+    if (err == vr::VRInitError_Init_NoServerForBackgroundApp) return kNoSteamVr;
     if (err != vr::VRInitError_None) {
         errf("SteamVR につながりません: %s", vr::VR_GetVRInitErrorAsEnglishDescription(err));
-        return false;
+        return kError;
     }
     vr::EVROverlayError oe = vr::VROverlay()->CreateOverlay(kOverlayKey, "frame-care", &v.toast);
     if (oe != vr::VROverlayError_None) {
         errf("オーバーレイを作れません: %s", oerr(oe));
         vr::VR_Shutdown();
-        return false;
+        return kError;
     }
     v.up = true;
     vr::VROverlay()->SetOverlayWidthInMeters(v.toast, float(o.width_m));
     vr::VROverlay()->SetOverlaySortOrder(v.toast, 100);
-    v.vk = new VulkanContext();
-    std::string verr;
-    v.use_vulkan = quiet_unless_failed([&] { return v.vk->init(verr); });
-    if (!v.use_vulkan) errf("Vulkan を使えないので SetOverlayRaw で出します（%s）", verr.c_str());
-    return true;
+    return kOk;
 }
 
-// 画像をオーバーレイに渡す（Vulkan が使えればテクスチャ、だめなら SetOverlayRaw）
+// 画像をオーバーレイに渡す。カードは見せる前（透明のうち）に 1 回渡すだけなので、SetOverlayRaw で足りる
 static bool upload(Vr& v, const std::vector<uint8_t>& rgba) {
-    if (v.use_vulkan) {
-        std::string err;
-        if (!v.tex) {
-            v.tex = new OverlayTexture();
-            if (!v.tex->create(*v.vk, card::kW, card::kH, err)) {
-                errf("Vulkan の画像を作れないので SetOverlayRaw に切り替えます（%s）", err.c_str());
-                delete v.tex;
-                v.tex = nullptr;
-                v.use_vulkan = false;
-            }
-        }
-        if (v.tex) {
-            if (v.tex->update(v.toast, rgba.data(), err)) return true;
-            errf("画像を渡せませんでした: %s", err.c_str());
-            return false;
-        }
-    }
     vr::EVROverlayError e =
         vr::VROverlay()->SetOverlayRaw(v.toast, const_cast<uint8_t*>(rgba.data()), uint32_t(card::kW), uint32_t(card::kH), 4);
     if (e != vr::VROverlayError_None) errf("SetOverlayRaw: %s", oerr(e));
@@ -278,7 +233,7 @@ int main(int argc, char** argv) {
     signal(SIGTERM, [](int) { g_stop = 1; });
     signal(SIGINT, [](int) { g_stop = 1; });
     Vr v;
-    if (!vr_start(v, o)) return kError;
+    if (int rc = vr_start(v, o)) return rc;
     int rc = kOk;
     for (size_t i = 0; i < cards.size() && !g_stop; i++) {
         if (!show(v, o, cards[i])) {

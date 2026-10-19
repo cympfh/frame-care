@@ -7,7 +7,7 @@
 #
 # 入れるもの: ~/.local/opt/frame-care/（本体と、カードを出す frame-care-toast。この場でビルドする）、
 #             ~/.config/systemd/user/frame-care.service、~/.config/frame-care/config.json（無いときだけサンプルからコピー）
-# ビルドには g++・cairo・pango・Vulkan を使う（SteamOS に入っている）。pacman などで何かを足すことはしない。
+# ビルドには g++・cairo・pango を使う（SteamOS に入っている）。pacman などで何かを足すことはしない。
 # 自動起動は勝手にオンにしない。SteamVR などは再起動しない。
 # 外すとき（--uninstall）は消さずに ~/.local/share/frame-care-uninstalled/<日時>/ に移す。設定ファイルはそのまま残す。
 set -euo pipefail

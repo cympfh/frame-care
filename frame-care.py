@@ -116,6 +116,8 @@ def toast_bin_problem(path):
 
 
 NO_STEAMVR, STEAMVR_QUIT = 3, 4   # frame-care-toast の終了コード
+MAX_PENDING = 20                   # 溜めておくカードの上限（超えたら古いものから捨てる）
+DEADLINE_SLACK = 15                # frame-care-toast を待つ時間 = 枚数 × 表示秒数 × 1.5 + これ（秒）
 
 
 class Toaster:
@@ -128,13 +130,19 @@ class Toaster:
     def __init__(self, cfg, binary=TOAST_BIN):
         self.binary = binary
         self.args = toast_args(cfg)
+        self.seconds = float(cfg["toast"]["duration_seconds"])
+        self.slack = DEADLINE_SLACK
         self.pending = []    # [(kind, title, text)]
         self.proc = None
         self.batch = []      # いま frame-care-toast に渡している分
+        self.deadline = None
         self.missing_logged = False
 
     def send(self, kind, title, text):
         self.pending.append((kind, title, text))
+        if len(self.pending) > MAX_PENDING:
+            dropped, self.pending = self.pending[:-MAX_PENDING], self.pending[-MAX_PENDING:]
+            self._lost(dropped, "溜まりすぎたので古いものを捨てました")
 
     def busy(self):
         return self.proc is not None and self.proc.poll() is None
@@ -145,6 +153,7 @@ class Toaster:
 
     def _finish(self):
         rc = self.proc.returncode
+        self.deadline = None
         if rc == NO_STEAMVR:
             self._lost(self.batch, "SteamVR が動いていません")
         elif rc == STEAMVR_QUIT:
@@ -153,9 +162,21 @@ class Toaster:
             self._lost(self.batch, "frame-care-toast がエラー %s で終わりました" % rc)
         self.proc, self.batch = None, []
 
+    def _reap(self, why):
+        """frame-care-toast を強制終了して片付ける（渡していたカードは出せなかったとログに書く）。"""
+        try:
+            self.proc.kill()
+            self.proc.wait(5)
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        self._lost(self.batch, why)
+        self.proc, self.batch, self.deadline = None, [], None
+
     def pump(self, steamvr):
         """前のカードが終わっていれば、溜まっている分を渡す。steamvr: SteamVR が動いているか。"""
         if self.busy():
+            if time.monotonic() > self.deadline:
+                self._reap("frame-care-toast が時間内に終わらないので止めました")
             return
         if self.proc is not None:
             self._finish()
@@ -175,31 +196,43 @@ class Toaster:
         self.missing_logged = False
         try:
             self.proc = subprocess.Popen([self.binary] + self.args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
-            self.proc.stdin.write("".join(toast_line(*c) for c in cards).encode("utf-8"))
-            self.proc.stdin.close()
-            self.batch = cards
         except OSError as e:
             log("frame-care-toast を起動できません:", e)
             self._lost(cards, "frame-care-toast を起動できません")
-            self.proc = None
+            return
+        self.batch = cards
+        self.deadline = time.monotonic() + len(cards) * self.seconds * 1.5 + self.slack
+        try:
+            self.proc.stdin.write("".join(toast_line(*c) for c in cards).encode("utf-8"))
+            self.proc.stdin.close()
+        except OSError:   # 読まずに終わった・閉じた: 残さず片付ける
+            self._reap("frame-care-toast にカードを渡せませんでした")
 
     def wait(self, timeout=None):
-        """出し終わるまで待つ。全部出せたら True。"""
+        """出し終わるまで待つ（timeout を過ぎたら stop()）。全部出せたら True。"""
         if self.proc is None:
             return not self.pending
         try:
             self.proc.wait(timeout)
         except subprocess.TimeoutExpired:
-            self.proc.terminate()
-            self.proc.wait()
+            self.stop()
+            return False
         ok = self.proc.returncode == 0
         self._finish()
         return ok
 
     def stop(self):
+        """出している途中でも止める: SIGTERM（frame-care-toast は切断して終わる）→ 3 秒待つ → SIGKILL。"""
+        if self.proc is None:
+            return
         if self.busy():
-            self.proc.terminate()   # frame-care-toast は SIGTERM で SteamVR から切断して終わる
-        self.wait(5)
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self._reap("frame-care-toast が止まらないので強制終了しました")
+                return
+        self._finish()
 
 
 # ------------------------------------------------------------------ センサー
@@ -245,9 +278,29 @@ def power(base="/sys/class/power_supply"):
     return percent, status, online
 
 
-def steamvr_running(proc="/proc"):
+def proc_name_state(stat):
+    """/proc/PID/stat の中身から (名前, 状態)。名前に空白や ) が入っていても読めるように、最後の ) で分ける。"""
+    try:
+        name = stat[stat.index("(") + 1:stat.rindex(")")]
+        return name, stat[stat.rindex(")") + 1:].split()[0]
+    except (ValueError, IndexError):
+        return None, None
+
+
+def steamvr_running(proc="/proc", uid=None):
+    """自分（同じ uid）の vrserver が動いているか。ゾンビ（状態 Z）は数えない。"""
+    uid = os.getuid() if uid is None else uid
     for d in os.listdir(proc):
-        if d.isdigit() and read(os.path.join(proc, d, "comm")) == "vrserver":
+        if not d.isdigit():
+            continue
+        path = os.path.join(proc, d)
+        try:
+            if os.stat(path).st_uid != uid:
+                continue
+        except OSError:
+            continue
+        name, state = proc_name_state(read(os.path.join(path, "stat")) or "")
+        if name == "vrserver" and state != "Z":
             return True
     return False
 

@@ -8,14 +8,20 @@
 - frame-care.py はカードを `frame-care-toast` の標準入力に 1 行 1 枚（`種類 TAB タイトル TAB 本文`）で渡します。
   frame-care-toast は SteamVR にオーバーレイでつなぎ、順にフェードイン・アウトで出し、出し終わったら切断して終わります。
   出している間に来たカードは frame-care.py が溜めておき、終わってから渡します（同時に 2 つは動かしません）。
-- **SteamVR を起動しない**: `vrserver` のプロセスが無ければ、frame-care.py は frame-care-toast を呼ばず、
-  frame-care-toast も `VR_Init` を呼ばずに終了コード 3 で終わります（`VR_Init` は SteamVR を起動してしまうため）。
+- **SteamVR を起動しない**: 自分（同じ uid）の `vrserver` が動いていなければ（ゾンビ = `/proc/PID/stat` の状態 Z は数えない）、
+  frame-care.py は frame-care-toast を呼ばず、frame-care-toast も `VR_Init` を呼ばずに終了コード 3 で終わります。
+  つなぐときも `VRApplication_Background` を使うので、確かめた直後に SteamVR が終わっていても起動はしません
+  （`VRInitError_Init_NoServerForBackgroundApp` = 121 になり、黙って終了コード 3 で終わります）。
 - カードを出すたびに新しくつなぐので、SteamVR を終了・再起動しても、次のカードから普通に出ます。
   出している途中で SteamVR が終わる知らせ（`VREvent_Quit`）が来たら `AcknowledgeQuit_Exiting` を呼んで切断し、終了コード 4 で終わります。
-  知らせなしに `vrserver` が居なくなったときも 1 秒以内に気づいて、それ以上 OpenVR を呼ばずに終わります。
+  知らせなしに `vrserver` が居なくなったときも 1 秒以内に気づき、表示の呼び出しをやめて `VR_Shutdown` だけ呼んで切断し、終了コード 4 で終わります。
+- frame-care.py は frame-care-toast を「枚数 × 表示秒数 × 1.5 + 15 秒」まで待ち、過ぎたら強制終了（SIGKILL）します。
+  止めるとき（systemd の停止など）は SIGTERM → 3 秒待つ → SIGKILL。溜めておくカードは 20 枚まで（超えたら古いものから捨てる）。
 - 見た目は vrc-wrist-notifier の Frame 版（wrist-toast 0.4.5）と同じカードです（640×160、幅 0.30 m、正面 0.8 m・少し下）。
-  描画は cairo + pango（`toast/card.h`）、画像は Vulkan のテクスチャで渡します（`third_party/frame-mic-tuner`。使えなければ `SetOverlayRaw`）。
-  `libopenvr_api.so` は SteamVR に入っているもの（`/opt/steamvr/bin/linuxarm64`）を使います。
+  描画は cairo + pango（`toast/card.h`）、画像は `SetOverlayRaw` で渡します。カードは見せる前（透明のうち）に 1 回渡すだけなので、
+  差し替えのちらつきは起きません。Frame で 25 回つなぎ直して出しても、vrcompositor は落ちませんでした（SIGBUS・コアダンプなし）。
+  `libopenvr_api.so` は SteamVR に入っているものを使います。`toast/build.sh` が `~/.config/openvr/openvrpaths.vrpath` の runtime
+  （OpenVR 自身が SteamVR を探す場所）、無ければ Steam のライブラリの `steamapps/common/SteamVR` から探します（`STEAMVR_LIB` で指定も可。`--find-lib` で確認）。
 - 種類は `基本.アイコン` の形です: `care.break` / `care.water` / `care.charge`（青緑）、`warn.battery` / `warn.temp`（琥珀）、`alert.battery` / `alert.temp`（赤。表示も 1.5 倍長い）。
 - 出力は「問題が無ければ何も書かない」です。ログに書くのは、出せなかったカード（SteamVR が動いていない、など）とエラーだけ。
   `--status` も問題があるときだけ書いて 1 で終わります（`-v` でいまの値も書く）。
@@ -70,7 +76,9 @@ python3 tests/test_frame_care.py
 ```
 
 作りものの値で判定を確かめ、本物の代わりの frame-care-toast（テストの中で作るスクリプト）で、渡すカードと、
-SteamVR が動いていないとき・部品が無いときのふるまい、`--status` が問題の無いときに黙ることを確かめます。
+SteamVR が動いていないとき・部品が無いときのふるまい、`--status` が問題の無いときに黙ること、
+固まった frame-care-toast（SIGTERM も無視するもの）を期限で止めること・`stop()` がすぐ戻ること、溜めるカードの上限、
+`vrserver` の判定（ゾンビ・ほかのユーザーは数えない）、`build.sh --find-lib` の探し方を確かめます。
 g++ と pango があれば `toast/card.h` の自己テストもします。設定ファイルと `XDG_CONFIG_HOME` は一時フォルダにするので、本物の `~/.config` には触りません。
 
 Frame の上では `~/.local/opt/frame-care/frame-care-toast --self-test` でも描画の自己テストができます。
@@ -78,4 +86,3 @@ Frame の上では `~/.local/opt/frame-care/frame-care-toast --self-test` でも
 ## 同梱しているもの
 
 - `vendor/openvr/openvr.h`（Valve、BSD-3-Clause、`vendor/openvr/LICENSE`）
-- `third_party/frame-mic-tuner/vk_texture.*`（sasaken1102r/frame-mic-tuner、MIT、無改変。くわしくは同じフォルダの README）
