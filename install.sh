@@ -5,8 +5,9 @@
 #   curl -fsSL https://raw.githubusercontent.com/cympfh/frame-care/main/install.sh | bash
 #   curl -fsSL https://raw.githubusercontent.com/cympfh/frame-care/main/install.sh | bash -s -- --uninstall
 #
-# 入れるもの: ~/.local/opt/frame-care/（本体）、~/.config/systemd/user/frame-care.service、
-#             ~/.config/frame-care/config.json（無いときだけサンプルからコピー）
+# 入れるもの: ~/.local/opt/frame-care/（本体と、カードを出す frame-care-toast。この場でビルドする）、
+#             ~/.config/systemd/user/frame-care.service、~/.config/frame-care/config.json（無いときだけサンプルからコピー）
+# ビルドには g++・cairo・pango を使う（SteamOS に入っている）。pacman などで何かを足すことはしない。
 # 自動起動は勝手にオンにしない。SteamVR などは再起動しない。
 # 外すとき（--uninstall）は消さずに ~/.local/share/frame-care-uninstalled/<日時>/ に移す。設定ファイルはそのまま残す。
 set -euo pipefail
@@ -72,6 +73,17 @@ if [[ "$here" != "$dest" ]]; then
     done
     chmod 755 "$dest/frame-care.py"
 fi
+# カードを出す frame-care-toast をビルドする（失敗しても frame-care は動く。知らせはログだけになる）
+log="${XDG_CACHE_HOME:-$HOME/.cache}/frame-care-build.log"
+mkdir -p "$(dirname "$log")"
+if bash "$here/toast/build.sh" "$dest/frame-care-toast.new" >"$log" 2>&1; then
+    mv -f "$dest/frame-care-toast.new" "$dest/frame-care-toast"
+    rm -f "$log"
+    built=1
+else
+    rm -f "$dest/frame-care-toast.new"
+    built=""
+fi
 # 設定ファイル: 無いときだけサンプルからコピー
 if [[ ! -f "$conf_dir/config.json" ]]; then
     cp "$here/config.example.json" "$conf_dir/config.json"
@@ -83,9 +95,15 @@ systemctl --user try-restart "$unit" 2>/dev/null || true
 
 cat <<MSG
 
-frame-care を入れました。（通知のカードは vrc-wrist-notifier の Frame 側が動いているときに出ます）
-  オンにする:  systemctl --user enable --now $name   （次からは SteamVR と一緒に起動）
-  いまの値:    python3 $dest/frame-care.py --status
-  オフにする:  systemctl --user disable --now $name
-  設定:        $conf_dir/config.json
+frame-care を入れました。
+  オンにする:   systemctl --user enable --now $name   （次からは SteamVR と一緒に起動）
+  テスト:       python3 $dest/frame-care.py --test-toast   （SteamVR を起動しているときにカードが 1 枚出ます）
+  オフにする:   systemctl --user disable --now $name
+  設定:         $conf_dir/config.json
 MSG
+if [[ -z "$built" ]]; then
+    echo
+    echo "注意: カードを出す部品（frame-care-toast）をビルドできませんでした。知らせはログに書くだけになります。"
+    echo "  くわしくは $log"
+    exit 1
+fi
