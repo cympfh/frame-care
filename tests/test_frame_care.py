@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
-"""frame-care のテスト。センサーは作りものの値、通知は localhost の UDP で受けて確かめる。
+"""frame-care のテスト。センサーは作りものの値、カードは本物の代わりの frame-care-toast で受けて確かめる。
+g++ と pango があれば、カードの描画（toast/card.h）の自己テストもする。
 
   python3 tests/test_frame_care.py
+
+設定ファイルや XDG_CONFIG_HOME はすべて一時フォルダにする（本物の ~/.config には触らない）。
 """
 import datetime as dt
 import importlib.util
 import json
 import os
-import socket
+import shutil
 import subprocess
 import sys
 import tempfile
-import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -20,8 +22,18 @@ spec = importlib.util.spec_from_file_location("fc", os.path.join(ROOT, "frame-ca
 fc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fc)
 
-TEST_PORT = int(os.environ.get("FRAME_CARE_TEST_PORT", "39580"))  # 本物の 39570 は使わない
+TMP = tempfile.mkdtemp(prefix="frame-care-test.")
+ENV = dict(os.environ, XDG_CONFIG_HOME=os.path.join(TMP, "xdg-config"), HOME=os.path.join(TMP, "home"))
 fails = []
+
+# 本物の frame-care-toast の代わり: 引数と受け取った行をファイルに書き、FAKE_TOAST_RC の終了コードで終わる
+FAKE_TOAST = """#!%s
+import os, sys
+with open(os.environ["FAKE_TOAST_OUT"], "a", encoding="utf-8") as f:
+    f.write("ARGS " + " ".join(sys.argv[1:]) + "\\n")
+    f.write(sys.stdin.buffer.read().decode("utf-8"))
+sys.exit(int(os.environ.get("FAKE_TOAST_RC", "0")))
+""" % sys.executable
 
 
 def check(cond, what):
@@ -42,15 +54,6 @@ def keys(items):
 
 def cfg(**over):
     return fc.merge(fc.DEFAULTS, over)
-
-
-def decode(buf):
-    parts, i = [], 0
-    while i < len(buf):
-        end = buf.index(b"\0", i)
-        parts.append(buf[i:end].decode("utf-8"))
-        i = (end + 4) & ~3
-    return parts
 
 
 def unit_tests():
@@ -127,57 +130,117 @@ def unit_tests():
         sent += keys(c.filter(t, w, [("break", "care", "t", "x")]))
     check(len(sent) == 2, "回数制限: 20 秒以内と 1 時間 2 回を超えた分は出さない")
     check(keys(c.filter(100, w, [("temp_urgent", "alert", "t", "x")])) == ["temp_urgent"], "回数制限: 高温は制限なし")
-    # OSC
+    # カードの種類と、frame-care-toast に渡す行
     check(set(fc.KINDS) == set(fc.MESSAGES) and all(v.split(".")[0] in ("alert", "warn", "care") for v in fc.KINDS.values())
           and all(fc.KINDS[k].startswith("alert.") for k in fc.URGENT), "種類: すべての通知に alert / warn / care が付き、急ぎは alert")
-    msg = fc.osc_message("/wrist/notify", "care", "休憩しよう", "本文")
-    check(len(msg) % 4 == 0 and decode(msg) == ["/wrist/notify", ",sss", "care", "休憩しよう", "本文"], "OSC: /wrist/notify ,sss")
+    check(fc.toast_line("care.break", "休憩\tしよう", "1 行目\n2 行目") == "care.break\t休憩 しよう\t1 行目 2 行目\n",
+          "渡す行: タブと改行は空白にして 1 行にする")
+    args = fc.toast_args(cfg(toast={"duration_seconds": 6}))
+    check(args[args.index("--duration-s") + 1] == "6" and "--distance-m" in args, "渡す引数: 設定の toast から")
+    check(fc.toast_bin_problem(os.path.join(TMP, "無い")) is not None, "frame-care-toast が無ければ問題として返す")
+    check(fc.problems({"temp_c": 50, "battery": 80}, sys.executable) == [] and
+          len(fc.problems({"temp_c": None, "battery": None}, sys.executable)) == 2, "問題の一覧: 無ければ空、読めない値は書く")
+    check(not any(k.startswith("toast_") for k in fc.DEFAULTS), "UDP の送り先の設定は無い")
 
 
-def run_daemon(conf, fake, seconds):
-    return subprocess.run([sys.executable, os.path.join(ROOT, "frame-care.py"), "--config", conf,
-                           "--fake-sensors", fake, "--port", str(TEST_PORT), "--poll", "0.5",
-                           "--duration", str(seconds)], capture_output=True, text=True, timeout=seconds + 20)
+def run(args, timeout=30, **env):
+    e = dict(ENV, **env)
+    return subprocess.run([sys.executable, os.path.join(ROOT, "frame-care.py")] + args, capture_output=True,
+                          text=True, timeout=timeout, env=e)
 
 
 def e2e_tests():
-    tmp = tempfile.mkdtemp(prefix="frame-care-test.")
-    conf, fake = os.path.join(tmp, "config.json"), os.path.join(tmp, "sensors.json")
+    tmp = tempfile.mkdtemp(dir=TMP)
+    conf, fake, out = os.path.join(tmp, "config.json"), os.path.join(tmp, "sensors.json"), os.path.join(tmp, "toast.txt")
+    toast = os.path.join(tmp, "frame-care-toast")
+    with open(toast, "w") as f:
+        f.write(FAKE_TOAST)
+    os.chmod(toast, 0o755)
     with open(conf, "w") as f:
         json.dump({"break": {"every_minutes": 0.05}, "rate_limit": {"min_gap_seconds": 0}}, f)
-    with open(fake, "w") as f:
-        json.dump(R(temp_c=91.0, battery=9), f)
-    # 受け手なし: ログだけ
-    if fc.udp_port_bound(TEST_PORT):
-        check(False, "テスト用ポート %d が使用中" % TEST_PORT)
+
+    def sensors(**kw):
+        with open(fake, "w") as f:
+            json.dump(R(**kw), f)
+
+    def daemon(seconds=4, **env):
+        if os.path.exists(out):
+            os.remove(out)
+        return run(["--config", conf, "--fake-sensors", fake, "--toast-bin", toast, "--poll", "0.5",
+                    "--duration", str(seconds)], timeout=seconds + 40, FAKE_TOAST_OUT=out, **env)
+
+    def got():
+        return open(out, encoding="utf-8").read() if os.path.exists(out) else ""
+
+    # SteamVR が動いている: カードを frame-care-toast に渡し、ログには何も書かない
+    sensors(temp_c=91.0, battery=9, steamvr=True)
+    p = daemon()
+    g = got()
+    lines = [l.split("\t") for l in g.splitlines() if "\t" in l]
+    print("     渡した:", [l[1] for l in lines])
+    check(any(l[0] == "alert.temp" and "高温" in l[1] for l in lines), "SteamVR あり: 高温のカード（alert.temp）を渡す")
+    check(any(l[0] == "alert.battery" and "電池残りわずか" in l[1] for l in lines), "SteamVR あり: 電池 9% のカードを渡す")
+    check(any(l[0] == "care.break" and "休憩" in l[1] for l in lines), "SteamVR あり: 休憩のカードを渡す（3 秒設定）")
+    check("--duration-s 4" in g and "--distance-m 0.8" in g, "SteamVR あり: 表示の設定を引数で渡す")
+    check(p.returncode == 0 and p.stdout == "" and p.stderr == "", "SteamVR あり: うまくいったときは何も出力しない（%r）" % (p.stdout + p.stderr))
+    # SteamVR が動いていない: frame-care-toast を呼ばず、出せなかったカードだけログに書く
+    sensors(temp_c=91.0, battery=9, steamvr=False, worn=False)
+    p = daemon(3)
+    check(got() == "" and "出せませんでした（SteamVR が動いていません）" in p.stdout and "高温" in p.stdout,
+          "SteamVR なし: 呼ばずに、出せなかったカードをログに書く")
+    # frame-care-toast が「SteamVR が動いていない」(3) で終わった
+    sensors(temp_c=91.0, battery=80, steamvr=True, worn=False)
+    p = daemon(3, FAKE_TOAST_RC="3")
+    check("出せませんでした（SteamVR が動いていません）: 本体が高温" in p.stdout, "frame-care-toast が 3 で終わったら、出せなかったとログに書く")
+    # frame-care-toast が無い: 1 回だけ理由を書き、カードはログに
+    p = run(["--config", conf, "--fake-sensors", fake, "--toast-bin", os.path.join(tmp, "無い"), "--poll", "0.5",
+             "--duration", "3"])
+    check(p.stdout.count("frame-care-toast がありません（install.sh") == 1 and "本体が高温" in p.stdout,
+          "frame-care-toast が無い: 理由を 1 回書き、カードはログに")
+    # --status: 問題が無ければ何も出さない。-v で値。問題があれば書いて 1
+    p = run(["--config", conf, "--fake-sensors", fake, "--toast-bin", toast, "--status"])
+    check(p.returncode == 0 and p.stdout == "" and p.stderr == "", "--status: 問題が無ければ何も出さない")
+    p = run(["--config", conf, "--fake-sensors", fake, "--toast-bin", toast, "--status", "-v"])
+    check(p.returncode == 0 and "温度 91.0°C" in p.stdout and "SteamVR: 動いている" in p.stdout, "--status -v: いまの値を書く")
+    sensors(temp_c=None, battery=80, steamvr=True)
+    p = run(["--config", conf, "--fake-sensors", fake, "--toast-bin", os.path.join(tmp, "無い"), "--status"])
+    check(p.returncode == 1 and "frame-care-toast がありません" in p.stdout and "温度が読めません" in p.stdout,
+          "--status: 問題があれば書いて 1 で終わる")
+    # --test-toast
+    sensors(steamvr=True)
+    if os.path.exists(out):
+        os.remove(out)
+    p = run(["--config", conf, "--fake-sensors", fake, "--toast-bin", toast, "--test-toast"], FAKE_TOAST_OUT=out)
+    check(p.returncode == 0 and p.stdout == "" and "care\tframe-care\tテスト通知です" in got(), "--test-toast: 1 枚渡して、何も出力しない")
+    sensors(steamvr=False, worn=False)
+    p = run(["--config", conf, "--fake-sensors", fake, "--toast-bin", toast, "--test-toast"], FAKE_TOAST_OUT=out)
+    check(p.returncode == 1 and "SteamVR が動いていない" in p.stderr, "--test-toast: SteamVR が動いていなければ 1 で終わる")
+    # 本物の設定フォルダに何も作っていない
+    check(not os.path.exists(os.path.join(ENV["XDG_CONFIG_HOME"], "frame-care")), "設定フォルダを作らない")
+
+
+def card_tests():
+    """toast/card.h の自己テスト（g++ と pangocairo があるときだけ）。"""
+    if not shutil.which("g++") or subprocess.run(["pkg-config", "--exists", "pangocairo"]).returncode != 0:
+        print("skip カードの描画（g++ か pangocairo がありません）")
         return
-    p = run_daemon(conf, fake, 4)
-    check("ログのみ" in p.stdout and "動いていない" in p.stdout, "受け手なし: ログに書くだけ")
-    # 受け手あり
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", TEST_PORT))
-    s.settimeout(0.2)
-    proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "frame-care.py"), "--config", conf,
-                             "--fake-sensors", fake, "--port", str(TEST_PORT), "--poll", "0.5", "--duration", "6"],
-                            stdout=subprocess.PIPE, text=True)
-    got, t0 = [], time.time()
-    while time.time() - t0 < 8:
-        try:
-            got.append(decode(s.recvfrom(4096)[0]))
-        except socket.timeout:
-            if proc.poll() is not None:
-                break
-    out = proc.communicate()[0]
-    titles = [g[3] for g in got]
-    print("     受け取った:", titles)
-    check(any(g[0] == "/wrist/notify" and g[2] == "alert.temp" and "高温" in g[3] for g in got), "受け手あり: 高温の通知が届く（種類 alert.temp）")
-    check(any("電池残りわずか" in t for t in titles), "受け手あり: 電池 9% の通知が届く")
-    check(any("休憩" in t for t in titles), "受け手あり: 休憩の通知が届く（3 秒設定）")
-    check("通知: " in out, "受け手あり: ログにも残る")
+    src, exe = os.path.join(TMP, "card_test.cpp"), os.path.join(TMP, "card_test")
+    with open(src, "w") as f:
+        f.write('#include "card.h"\nint main() { return card::self_test() ? 1 : 0; }\n')
+    flags = subprocess.run(["pkg-config", "--cflags", "--libs", "pangocairo", "cairo"], capture_output=True,
+                           text=True).stdout.split()
+    b = subprocess.run(["g++", "-std=c++17", "-Wall", "-Wextra", "-Werror", "-I", os.path.join(ROOT, "toast"), "-o", exe,
+                        src] + flags, capture_output=True, text=True)
+    check(b.returncode == 0, "カードの描画: ビルドできる %s" % b.stderr[-500:])
+    if b.returncode == 0:
+        r = subprocess.run([exe], capture_output=True, text=True)
+        check(r.returncode == 0, "カードの描画: 自己テスト %s" % r.stdout)
 
 
 if __name__ == "__main__":
     unit_tests()
     e2e_tests()
+    card_tests()
+    shutil.rmtree(TMP, ignore_errors=True)
     print("\n%s" % ("すべて OK" if not fails else "失敗 %d 件" % len(fails)))
     sys.exit(1 if fails else 0)

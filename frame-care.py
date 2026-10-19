@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: MIT
 """frame-care: Steam Frame をかぶっている間の「休憩・水分・電池・温度・充電完了」をそっと知らせる。
 
-通知は vrc-wrist-notifier の表示係（UDP 39570 の OSC /wrist/notify）に送ってカードとして出す。
-表示係が動いていなければ、ログ（journalctl）に書くだけにする。Python 3 の標準ライブラリだけで動く。
+カードは同じフォルダの frame-care-toast（C++、install.sh がビルドする）が SteamVR のオーバーレイとして視界の正面に出す。
+SteamVR が動いていないときは出さない（SteamVR を起動することはない）。出せなかったカードだけログ（journalctl）に書く。
+問題がなければ何も出力しない。この Python 部分は標準ライブラリだけで動く。
 
   frame-care.py                  常駐（systemd --user から起動する想定）
-  frame-care.py --status         いまの値と、通知がどうなるかを表示して終わる
-  frame-care.py --test-toast     テストのカードを 1 枚送って終わる
+  frame-care.py --status         問題があるときだけ書く（-v でいまの値も）
+  frame-care.py --test-toast     テストのカードを 1 枚出す
 """
 import argparse
 import datetime as dt
@@ -15,17 +16,18 @@ import glob
 import json
 import os
 import signal
-import socket
-import struct
+import subprocess
 import sys
 import time
 
-VERSION = "0.1.1"
+VERSION = "0.2.0"
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOAST_BIN = os.path.join(HERE, "frame-care-toast")
 
 DEFAULTS = {
-    "toast_host": "127.0.0.1",
-    "toast_port": 39570,
-    "check_toast_running": True,   # localhost の表示係が動いていないときはログだけにする
+    # カードの出し方（frame-care-toast に渡す）。急ぎ（alert）は 1.5 倍の時間出す
+    "toast": {"duration_seconds": 4, "width_m": 0.30, "distance_m": 0.8, "offset_y_m": -0.18,
+              "font": "Noto Sans CJK JP"},
     "poll_seconds": 30,
     "presence": {
         "source": "steamvr",          # steamvr = SteamVR が動いている間をかぶっている時間とみなす / proximity = 近接センサー
@@ -52,8 +54,7 @@ MESSAGES = {
     "test": ("frame-care", "テスト通知です。これが見えれば準備OK"),
 }
 URGENT = {"battery_urgent", "temp_urgent"}          # 静かな時間でも出す
-# カードの種類（vrc-wrist-notifier 0.2.1 から色とアイコンが変わる: alert = 赤、warn = 琥珀、care = 青緑。
-# 「.」のあとはアイコン。古い wrist-toast でも表示はされる（色は青）
+# カードの種類: alert = 赤（表示も長め）、warn = 琥珀、care = 青緑。「.」のあとはアイコン
 KINDS = {
     "break": "care.break", "hydration": "care.water", "charge_done": "care.charge",
     "battery": "warn.battery", "temp_warn": "warn.temp",
@@ -91,59 +92,114 @@ def load_config(path):
     return cfg
 
 
-# ------------------------------------------------------------------ OSC
-def _pad(b):
-    return b + b"\0" * (4 - len(b) % 4)
+# ------------------------------------------------------------------ カード
+def toast_line(kind, title, text):
+    """frame-care-toast に渡す 1 行（種類 TAB タイトル TAB 本文）。タブと改行は空白にする。"""
+    def one(x):
+        return " ".join(str(x).replace("\t", " ").splitlines())
+    return "%s\t%s\t%s\n" % (one(kind), one(title), one(text))
 
 
-def osc_message(address, *strings):
-    msg = _pad(address.encode()) + _pad(("," + "s" * len(strings)).encode())
-    for s in strings:
-        msg += _pad(str(s).encode("utf-8"))
-    return msg
+def toast_args(cfg):
+    t = cfg["toast"]
+    return ["--duration-s", str(t["duration_seconds"]), "--width-m", str(t["width_m"]),
+            "--distance-m", str(t["distance_m"]), "--offset-y-m", str(t["offset_y_m"]), "--font", str(t["font"])]
 
 
-def udp_port_bound(port, tables=("/proc/net/udp", "/proc/net/udp6")):
-    """この Frame の中で、だれかがその UDP ポートで待ち受けているか。"""
-    want = ":%04X" % port
-    for t in tables:
-        try:
-            with open(t) as f:
-                next(f)
-                for line in f:
-                    local = line.split()[1]
-                    if local.endswith(want):
-                        return True
-        except (OSError, StopIteration, IndexError):
-            pass
-    return False
+def toast_bin_problem(path):
+    """frame-care-toast が使えなければその理由、使えれば None。"""
+    if not os.path.isfile(path):
+        return "カードを出す frame-care-toast がありません（install.sh で入れ直してください）: " + path
+    if not os.access(path, os.X_OK):
+        return "frame-care-toast を実行できません: " + path
+    return None
+
+
+NO_STEAMVR, STEAMVR_QUIT = 3, 4   # frame-care-toast の終了コード
 
 
 class Toaster:
-    def __init__(self, cfg):
-        self.host = cfg["toast_host"]
-        self.port = int(cfg["toast_port"])
-        self.check = cfg.get("check_toast_running", True) and self.host in ("127.0.0.1", "localhost")
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.last_state = None
+    """カードを frame-care-toast に渡して SteamVR に出す。
 
-    def available(self):
-        ok = (not self.check) or udp_port_bound(self.port)
-        if ok != self.last_state:
-            log("表示係（UDP %d）: %s" % (self.port, "見つかりました。カードで知らせます" if ok
-                                          else "動いていないので、ログに書くだけにします"))
-            self.last_state = ok
-        return ok
+    frame-care-toast は渡された分を出し終わると SteamVR から切断して終わる。出している間に来たカードは溜めておき、
+    終わってからまとめて渡す（同時に 2 つ動かさない）。SteamVR の再起動をまたいでも、次のカードで新しくつなぐだけ。
+    """
+
+    def __init__(self, cfg, binary=TOAST_BIN):
+        self.binary = binary
+        self.args = toast_args(cfg)
+        self.pending = []    # [(kind, title, text)]
+        self.proc = None
+        self.batch = []      # いま frame-care-toast に渡している分
+        self.missing_logged = False
 
     def send(self, kind, title, text):
-        if not self.available():
-            return False
+        self.pending.append((kind, title, text))
+
+    def busy(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def _lost(self, cards, why):
+        for _, title, text in cards:
+            log("出せませんでした（%s）: %s / %s" % (why, title, text))
+
+    def _finish(self):
+        rc = self.proc.returncode
+        if rc == NO_STEAMVR:
+            self._lost(self.batch, "SteamVR が動いていません")
+        elif rc == STEAMVR_QUIT:
+            self._lost(self.batch, "途中で SteamVR が終わりました")
+        elif rc != 0:
+            self._lost(self.batch, "frame-care-toast がエラー %s で終わりました" % rc)
+        self.proc, self.batch = None, []
+
+    def pump(self, steamvr):
+        """前のカードが終わっていれば、溜まっている分を渡す。steamvr: SteamVR が動いているか。"""
+        if self.busy():
+            return
+        if self.proc is not None:
+            self._finish()
+        if not self.pending:
+            return
+        cards, self.pending = self.pending, []
+        if not steamvr:
+            self._lost(cards, "SteamVR が動いていません")
+            return
+        problem = toast_bin_problem(self.binary)
+        if problem:
+            if not self.missing_logged:
+                log(problem)
+                self.missing_logged = True
+            self._lost(cards, "frame-care-toast がありません")
+            return
+        self.missing_logged = False
         try:
-            self.sock.sendto(osc_message("/wrist/notify", kind, title, text), (self.host, self.port))
-            return True
+            self.proc = subprocess.Popen([self.binary] + self.args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+            self.proc.stdin.write("".join(toast_line(*c) for c in cards).encode("utf-8"))
+            self.proc.stdin.close()
+            self.batch = cards
         except OSError as e:
-            log("送れませんでした:", e)
-            return False
+            log("frame-care-toast を起動できません:", e)
+            self._lost(cards, "frame-care-toast を起動できません")
+            self.proc = None
+
+    def wait(self, timeout=None):
+        """出し終わるまで待つ。全部出せたら True。"""
+        if self.proc is None:
+            return not self.pending
+        try:
+            self.proc.wait(timeout)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            self.proc.wait()
+        ok = self.proc.returncode == 0
+        self._finish()
+        return ok
+
+    def stop(self):
+        if self.busy():
+            self.proc.terminate()   # frame-care-toast は SIGTERM で SteamVR から切断して終わる
+        self.wait(5)
 
 
 # ------------------------------------------------------------------ センサー
@@ -213,18 +269,21 @@ class Sensors:
         self.fake = fake
 
     def reading(self):
-        if self.fake:  # テスト用: JSON ファイルの値を毎回読み直す
+        if self.fake:  # テスト用: JSON ファイルの値を毎回読み直す（steamvr が無ければ worn と同じ）
             with open(self.fake, encoding="utf-8") as f:
-                return json.load(f)
+                r = json.load(f)
+            r.setdefault("steamvr", bool(r.get("worn")))
+            return r
         percent, status, online = power()
         pres = self.cfg["presence"]
         prox = proximity_raw()
+        steamvr = steamvr_running()
         if pres.get("source") == "proximity" and pres.get("proximity_threshold") is not None and prox is not None:
             worn = prox > float(pres["proximity_threshold"])
         else:
-            worn = steamvr_running()
+            worn = steamvr
         return {"temp_c": soc_temp_c(), "battery": percent, "status": status, "online": online,
-                "worn": worn, "proximity": prox}
+                "worn": worn, "proximity": prox, "steamvr": steamvr}
 
 
 # ------------------------------------------------------------------ 判定
@@ -348,14 +407,11 @@ class Care:
         for key, kind, title, text in items:
             urgent = key in URGENT
             if in_quiet(qh, wall) and not (urgent and qh.get("allow_urgent", True)):
-                log("静かな時間なので出しません:", title)
                 continue
             if key not in NO_RATE_LIMIT:
                 if self.last_sent is not None and now - self.last_sent < rl["min_gap_seconds"]:
-                    log("間隔が短いので出しません:", title)
                     continue
                 if len(self.sent_times) >= rl["max_per_hour"]:
-                    log("1 時間の上限なので出しません:", title)
                     continue
             self.last_sent = now
             self.sent_times.append(now)
@@ -373,66 +429,95 @@ def clock():
 
 
 def describe(r):
-    return "温度 %s / 電池 %s%% (%s, 電源%s) / かぶっている: %s / 近接センサー %s" % (
+    return "温度 %s / 電池 %s%% (%s, 電源%s) / かぶっている: %s / SteamVR: %s / 近接センサー %s" % (
         "%.1f°C" % r["temp_c"] if r.get("temp_c") is not None else "?", r.get("battery"), r.get("status"),
-        "あり" if r.get("online") else "なし", "はい" if r.get("worn") else "いいえ", r.get("proximity"))
+        "あり" if r.get("online") else "なし", "はい" if r.get("worn") else "いいえ",
+        "動いている" if r.get("steamvr") else "動いていない", r.get("proximity"))
+
+
+def problems(r, toast_bin):
+    """知らせが正しく出せない理由の一覧（問題が無ければ空）。"""
+    out = []
+    p = toast_bin_problem(toast_bin)
+    if p:
+        out.append(p)
+    if r.get("temp_c") is None:
+        out.append("本体の温度が読めません（温度の知らせは出ません）")
+    if r.get("battery") is None:
+        out.append("電池の残りが読めません（電池と充電完了の知らせは出ません）")
+    return out
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Steam Frame の休憩・電池・温度のお知らせ")
     ap.add_argument("--config", default=default_config_path())
-    ap.add_argument("--status", action="store_true", help="いまの値を表示して終わる")
-    ap.add_argument("--test-toast", action="store_true", help="テストのカードを 1 枚送る")
+    ap.add_argument("--status", action="store_true", help="問題があるときだけ書いて終わる（問題が無ければ何も出さない）")
+    ap.add_argument("-v", "--verbose", action="store_true", help="--status でいまの値も書く")
+    ap.add_argument("--test-toast", action="store_true", help="テストのカードを 1 枚出す")
     ap.add_argument("--fake-sensors", help="テスト用: センサーの代わりにこの JSON を読む")
-    ap.add_argument("--port", type=int, help="送り先ポートを上書き（テスト用）")
+    ap.add_argument("--toast-bin", default=TOAST_BIN, help="テスト用: frame-care-toast の場所")
     ap.add_argument("--poll", type=float, help="値を読む間隔（秒）を上書き")
     ap.add_argument("--duration", type=float, help="この秒数で終わる（テスト用）")
     ap.add_argument("--version", action="version", version=VERSION)
     a = ap.parse_args(argv)
 
-    cfg = load_config(a.config)
-    if a.port:
-        cfg["toast_port"] = a.port
+    try:
+        cfg = load_config(a.config)
+    except (OSError, ValueError) as e:
+        print("設定ファイルが読めません: %s（%s）" % (a.config, e), file=sys.stderr)
+        return 1
     if a.poll:
         cfg["poll_seconds"] = a.poll
-    toaster = Toaster(cfg)
+    toaster = Toaster(cfg, a.toast_bin)
     sensors = Sensors(cfg, a.fake_sensors)
 
     if a.status:
-        print(describe(sensors.reading()))
-        print("表示係（UDP %d）: %s" % (cfg["toast_port"], "動いています" if udp_port_bound(cfg["toast_port"]) else "見つかりません（ログだけになります）"))
-        print("静かな時間:", "いま静かな時間です" if in_quiet(cfg["quiet_hours"], dt.datetime.now()) else "いいえ")
-        return 0
+        r = sensors.reading()
+        found = problems(r, a.toast_bin)
+        if a.verbose:
+            print(describe(r))
+            print("静かな時間:", "いま静かな時間です" if in_quiet(cfg["quiet_hours"], dt.datetime.now()) else "いいえ")
+            print("設定:", a.config if os.path.exists(a.config) else "既定値")
+        for p in found:
+            print(p)
+        return 1 if found else 0
     if a.test_toast:
-        ok = toaster.send(KINDS["test"], *MESSAGES["test"])
-        print("送りました" if ok else "表示係が動いていないので送っていません")
-        return 0 if ok else 1
+        if not sensors.reading().get("steamvr"):
+            print("SteamVR が動いていないので出せません", file=sys.stderr)
+            return 1
+        problem = toast_bin_problem(a.toast_bin)
+        if problem:
+            print(problem, file=sys.stderr)
+            return 1
+        toaster.send(KINDS["test"], *MESSAGES["test"])
+        toaster.pump(True)
+        return 0 if toaster.wait(30) else 1
 
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
     care = Care(cfg)
-    log("frame-care %s を開始（設定 %s）" % (VERSION, a.config if os.path.exists(a.config) else "既定値"))
     t_end = time.monotonic() + a.duration if a.duration else None
-    first = True
+    steamvr = False
     while not stop and (t_end is None or time.monotonic() < t_end):
         try:
             r = sensors.reading()
-            if first:
-                log("いまの値:", describe(r))
-                toaster.available()
-                first = False
+            steamvr = bool(r.get("steamvr"))
             now = clock()
             for key, kind, title, text in care.filter(now, dt.datetime.now(), care.evaluate(now, r)):
-                sent = toaster.send(kind, title, text)
-                log("%s: %s / %s" % ("通知" if sent else "通知（ログのみ）", title, text))
+                toaster.send(kind, title, text)
         except Exception as e:  # センサーが一時的に読めなくても止まらない
             log("エラー:", repr(e))
         slept = 0.0
         while not stop and slept < cfg["poll_seconds"]:
+            toaster.pump(steamvr)
             time.sleep(min(0.5, cfg["poll_seconds"]))
             slept += 0.5
-    log("終了します")
+    toaster.pump(steamvr)
+    if stop:
+        toaster.stop()      # systemd などに止められた: 出している途中でも切断して終わる
+    else:
+        toaster.wait(30)    # --duration で終わるとき（テスト）は出し終わるのを待つ
     return 0
 
 

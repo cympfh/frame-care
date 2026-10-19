@@ -1,20 +1,17 @@
 # frame-care
 
-Steam Frame をかぶっている間、**1 時間ごとの休憩・電池の残り・本体の熱さ・充電完了** を、視界に小さなカードでそっと知らせます。
+Steam Frame をかぶっている間、**1 時間ごとの休憩・電池の残り・本体の熱さ・充電完了** を、視界の正面に小さなカードでそっと知らせます。
 夢中になっていても、目の疲れや電池切れ、熱による強制終了に気づけます。
 
-```
-休憩しよう       連続 60 分かぶっています。少し外して目と首を休めませんか
-電池残り 20%     電池が 20% です。早めに充電を
-本体が高温 90°C  いったん休ませてください
-```
+![カードの例](docs/cards.png)
 
-カードの表示には [vrc-wrist-notifier](https://github.com/cympfh/vrc-wrist-notifier) の Frame 側を使います（先に入れてオンにしておく）。
-入っていないときは、知らせる内容をログに書くだけになります。
+色の意味: 赤 = 急ぎ（少し長めに出ます）、オレンジ = 注意、青緑 = お知らせ。
+
+ほかのアプリは要りません。SteamVR を起動しているときだけカードを出します（frame-care が SteamVR を起動することはありません）。
 
 ## インストール
 
-Frame の Konsole に貼り付けて Enter:
+Frame のデスクトップモードで Konsole を開き、貼り付けて Enter:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/cympfh/frame-care/main/install.sh | bash
@@ -27,6 +24,8 @@ systemctl --user enable --now frame-care    # オン（次からは SteamVR と�
 systemctl --user disable --now frame-care   # オフ
 ```
 
+SteamVR を起動した状態で `python3 ~/.local/opt/frame-care/frame-care.py --test-toast` を実行すると、テストのカードが 1 枚出ます。
+
 ## 知らせること（最初の設定）
 
 | いつ | 内容 |
@@ -37,7 +36,7 @@ systemctl --user disable --now frame-care   # オフ
 | 充電が終わったとき | 充電完了 |
 | 水分補給（最初はオフ） | 45 分ごとに一口どうぞ |
 
-時間や温度、夜中は知らせない「静かな時間」は、設定ファイル `~/.config/frame-care/config.json` で変えられます（初回にサンプルからコピー）。
+時間や温度、夜中は知らせない「静かな時間」は、設定ファイル `~/.config/frame-care/config.json` で変えられます。
 
 ## アンインストール
 
@@ -50,12 +49,12 @@ curl -fsSL https://raw.githubusercontent.com/cympfh/frame-care/main/install.sh |
 <details>
 <summary>くわしい情報（設定・開発者向け）</summary>
 
-- いまの値の確認: `python3 ~/.local/opt/frame-care/frame-care.py --status`、カードのテスト: `... --test-toast`
-- 設定の項目と仕組み: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
+- 困ったとき: `python3 ~/.local/opt/frame-care/frame-care.py --status`（問題があるときだけ書きます。`-v` でいまの値も）
+- ログ: `journalctl --user -u frame-care -f`（出せなかったカードとエラーだけ書きます）
 - 静かな時間でも、90 °C 以上と電池 10% 以下は知らせます。それ以外は 20 秒に 1 回・1 時間 12 回まで
 - 「かぶっている時間」は、最初は SteamVR が動いている時間で数えます（近接センサーも選べます）
-- ログ: `journalctl --user -u frame-care -f`
-- Python 3 の標準ライブラリだけで動き、sudo は使いません
+- sudo は使いません。カードを出す部品はインストールのときに Frame の上でビルドします
+- 設定の項目と仕組み: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)
 
 </details>
 
