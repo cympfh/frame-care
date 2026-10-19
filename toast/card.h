@@ -37,7 +37,7 @@ inline bool is_alert(const std::string& kind) {
 
 inline const char* icon(const std::string& kind) {
     std::string sub = kind_sub(kind), base = kind_base(kind);
-    if (sub == "temp") return "🌡";
+    if (sub == "temp") return "🌡\uFE0F";   // U+1F321 は文字のままだと白黒になるので、絵文字にする印（VS16）を付ける
     if (sub == "battery") return "🔋";
     if (sub == "charge") return "⚡";
     if (sub == "break") return "☕";
@@ -180,7 +180,7 @@ inline int self_test() {
         if (!ok) { printf("FAIL %s\n", what); fails++; }
     };
     Rgb c = color("alert.temp");
-    check(c.r > 0.9 && c.g < 0.4 && std::string(icon("alert.temp")) == "🌡" && is_alert("urgent"), "alert.temp は赤で温度計");
+    check(c.r > 0.9 && c.g < 0.4 && std::string(icon("alert.temp")) == "🌡\uFE0F" && is_alert("urgent"), "alert.temp は赤で温度計");
     c = color("warn.battery");
     check(c.r > 0.9 && c.g > 0.5 && c.b < 0.2 && std::string(icon("warn.battery")) == "🔋", "warn.battery は琥珀で電池");
     c = color("care.break");
