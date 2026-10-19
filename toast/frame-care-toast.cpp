@@ -66,6 +66,32 @@ static bool steamvr_running() {
     return found;
 }
 
+// f() のあいだ stderr に書かれたものを預かり、f() が失敗したときだけ出す
+// （vk_texture.cpp は無改変のコピーで、うまくいったときも使う GPU などを書くので、問題が無いときは黙らせる）
+template <class F>
+static bool quiet_unless_failed(F f) {
+    fflush(stderr);
+    FILE* held = tmpfile();
+    int saved = held ? dup(2) : -1;
+    if (saved >= 0) dup2(fileno(held), 2);
+    bool ok = f();
+    fflush(stderr);
+    if (saved >= 0) {
+        dup2(saved, 2);
+        close(saved);
+    }
+    if (held) {
+        if (!ok) {
+            rewind(held);
+            char buf[512];
+            size_t n;
+            while ((n = fread(buf, 1, sizeof buf, held)) > 0) fwrite(buf, 1, n, stderr);
+        }
+        fclose(held);
+    }
+    return ok;
+}
+
 static double now_s() {
     using namespace std::chrono;
     return duration<double>(steady_clock::now().time_since_epoch()).count();
@@ -112,7 +138,7 @@ static bool vr_start(Vr& v, const Options& o) {
     vr::VROverlay()->SetOverlaySortOrder(v.toast, 100);
     v.vk = new VulkanContext();
     std::string verr;
-    v.use_vulkan = v.vk->init(verr);
+    v.use_vulkan = quiet_unless_failed([&] { return v.vk->init(verr); });
     if (!v.use_vulkan) errf("Vulkan を使えないので SetOverlayRaw で出します（%s）", verr.c_str());
     return true;
 }
